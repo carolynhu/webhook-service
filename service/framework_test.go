@@ -57,6 +57,18 @@ func init() {
 	}
 	drivers.Drivers["scaleHost"] = &MockHostDriver{expectedConfig: expectedHostConfig}
 
+	HostTemplateID := "1ht1"
+	expectedHostWithTemplateIDConfig := model.ScaleByHostTemplateID{
+		HostTemplateID: HostTemplateID,
+		Amount:         1,
+		Action:         "up",
+		Min:            1,
+		Max:            4,
+		DeleteOption:   "mostRecent",
+	}
+
+	drivers.Drivers["scaleByHostTemplateID"] = &MockHostWithTemplateIDDriver{expectedConfig: expectedHostWithTemplateIDConfig}
+
 	privateKey := util.ParsePrivateKey("../testutils/private.pem")
 	publicKey := util.ParsePublicKey("../testutils/public.pem")
 	r = &RouteHandler{
