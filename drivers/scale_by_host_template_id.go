@@ -1,16 +1,12 @@
 package drivers
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 
 	log "github.com/Sirupsen/logrus"
 	"github.com/mitchellh/mapstructure"
@@ -78,9 +74,6 @@ func (s *ScaleByHostTemplateIDDriver) ValidatePayload(conf interface{}, apiClien
 func (s *ScaleByHostTemplateIDDriver) Execute(conf interface{}, apiClient *client.RancherClient, reqBody interface{}) (int, error) {
 	var currNameSuffix, baseHostName, currCloneName, suffix string
 	var count, index, newHostScale, baseHostIndex int64
-	httpClient := &http.Client{
-		Timeout: time.Second * 10,
-	}
 
 	config := &model.ScaleByHostTemplateID{}
 	err := mapstructure.Decode(conf, config)
@@ -88,6 +81,7 @@ func (s *ScaleByHostTemplateIDDriver) Execute(conf interface{}, apiClient *clien
 		return http.StatusInternalServerError, errors.Wrap(err, "Couldn't unmarshal config")
 	}
 
+	hostTemplateID := config.HostTemplateID
 	action := config.Action
 	amount := config.Amount
 	min := config.Min
@@ -105,6 +99,7 @@ func (s *ScaleByHostTemplateIDDriver) Execute(conf interface{}, apiClient *clien
 	filters := make(map[string]interface{})
 	filters["sort"] = "created"
 	filters["order"] = "desc"
+	filters["hostTemplateId"] = hostTemplateID
 	hostCollection, err := apiClient.Host.List(&client.ListOpts{
 		Filters: filters,
 	})
@@ -115,14 +110,10 @@ func (s *ScaleByHostTemplateIDDriver) Execute(conf interface{}, apiClient *clien
 	hostScalingGroup := []client.Host{}
 	baseHostIndex = -1
 	for _, host := range hostCollection.Data {
-		if config.HostTemplateID != "" {
-			// add hosts with specified hostTemplateId
-			if host.HostTemplateId == config.HostTemplateID {
-				hostScalingGroup = append(hostScalingGroup, host)
-				if host.Driver != "" {
-					baseHostIndex = int64(len(hostScalingGroup)) - 1
-				}
-			}
+		// add hosts with specified hostTemplateId
+		hostScalingGroup = append(hostScalingGroup, host)
+		if host.Driver != "" {
+			baseHostIndex = int64(len(hostScalingGroup)) - 1
 		}
 	}
 
@@ -147,15 +138,12 @@ func (s *ScaleByHostTemplateIDDriver) Execute(conf interface{}, apiClient *clien
 		baseSuffix := reg.FindString(baseHostName)
 		basePrefix := strings.TrimRight(baseHostName, baseSuffix)
 
-		// Use raw call to get host so as to get additional driver config
-		getURL := cattleURL + "/projects/" + host.AccountId + "/hosts/" + host.Id
-		log.Infof("Getting config for host %s as base host for cloning", host.Id)
-		hostRaw, err := getHostsByTemplateID(getURL, httpClient, cattleConfig.CattleAccessKey, cattleConfig.CattleSecretKey)
+		hst, err := apiClient.Host.ById(host.Id)
+
 		if err != nil {
 			return http.StatusInternalServerError, err
 		}
 
-		hostCreateURL := cattleURL + "/projects/" + host.AccountId + "/hosts"
 		newHostScale = amount + int64(len(hostScalingGroup))
 		if newHostScale > max {
 			return http.StatusBadRequest, fmt.Errorf("Cannot scale above provided max scale value")
@@ -193,13 +181,14 @@ func (s *ScaleByHostTemplateIDDriver) Execute(conf interface{}, apiClient *clien
 			}
 
 			name := basePrefix + currNameSuffix
-			hostRaw["name"] = ""
-			hostRaw["hostname"] = name
+			hst.Name = ""
+			hst.Hostname = name
 
 			log.Infof("Creating host with hostname: %s", name)
-			code, err := createHostByTemplateID(hostRaw, hostCreateURL, httpClient, cattleConfig.CattleAccessKey, cattleConfig.CattleSecretKey)
+
+			_, err := apiClient.Host.Create(hst)
 			if err != nil {
-				return code, err
+				return http.StatusInternalServerError, nil
 			}
 
 			suffix = currNameSuffix
@@ -319,65 +308,6 @@ func (s *ScaleByHostTemplateIDDriver) CustomizeSchema(schema *v1client.Schema) *
 	schema.ResourceFields["deleteOption"] = deleteOption
 
 	return schema
-}
-
-func getHostsByTemplateID(hostURL string, httpClient *http.Client, accessKey string, secretKey string) (map[string]interface{}, error) {
-	hostsResp := make(map[string]interface{})
-	request, err := http.NewRequest("GET", hostURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("Error creating request to get host: %v", err)
-	}
-
-	request.SetBasicAuth(accessKey, secretKey)
-	resp, err := httpClient.Do(request)
-	if err != nil {
-		return nil, err
-	}
-
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("Error %s in http.Get of host", resp.Status)
-	}
-
-	respBytes, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	err = json.Unmarshal(respBytes, &hostsResp)
-	if err != nil {
-		return nil, err
-	}
-
-	return hostsResp, nil
-}
-
-func createHostByTemplateID(host map[string]interface{}, hostCreateURL string, httpClient *http.Client, accessKey string, secretKey string) (int, error) {
-	hostJSON, err := json.Marshal(host)
-	if err != nil {
-		return http.StatusInternalServerError, fmt.Errorf("Error in JSON marshal of host: %v", err)
-	}
-
-	request, err := http.NewRequest("POST", hostCreateURL, bytes.NewBuffer(hostJSON))
-	if err != nil {
-		return http.StatusInternalServerError, fmt.Errorf("Error creating request to create host: %v", err)
-	}
-
-	request.SetBasicAuth(accessKey, secretKey)
-	request.Header.Set("Content-Type", "application/json")
-	resp, err := httpClient.Do(request)
-	if err != nil {
-		return http.StatusInternalServerError, fmt.Errorf("Error creating host: %v", err)
-	}
-
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 300 {
-		return resp.StatusCode, fmt.Errorf("Error %s in http.Post while creating host", resp.Status)
-	}
-
-	return http.StatusOK, nil
 }
 
 func deleteHostByTemplateID(hostID string, apiClient *client.RancherClient) (int, error) {
